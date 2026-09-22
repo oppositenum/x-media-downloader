@@ -290,6 +290,45 @@ def job_cancelled(job_id: str) -> bool:
         return bool(job and job.get("cancel"))
 
 
+def probe_media(video_path: Path) -> dict[str, Any]:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe or not video_path.exists():
+        return {}
+    proc = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height:format=duration",
+            "-of",
+            "json",
+            str(video_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return {}
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {}
+    stream = (data.get("streams") or [{}])[0]
+    duration = 0.0
+    try:
+        duration = float((data.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    return {
+        "width": int(stream.get("width") or 0),
+        "height": int(stream.get("height") or 0),
+        "duration": duration,
+    }
+
+
 def extract_thumb(video_path: Path) -> str:
     dest = thumbs_dir() / f"{video_path.stem}.jpg"
     if dest.exists() and dest.stat().st_size > 0:
@@ -334,6 +373,12 @@ def ensure_thumb(prepared: xdl.PreparedDownload) -> str:
 
 def finish_item(job_id: str, prepared: xdl.PreparedDownload, skipped: bool, final: bool = True) -> None:
     size = prepared.dest.stat().st_size if prepared.dest.exists() else 0
+    probed = probe_media(prepared.dest) if prepared.dest.exists() else {}
+    if probed.get("height") and not prepared.fmt.height:
+        prepared.fmt.height = int(probed["height"])
+        prepared.fmt.width = int(probed.get("width") or prepared.fmt.width or 0)
+    if probed.get("duration") and not prepared.duration:
+        prepared.duration = float(probed["duration"])
     thumb = ensure_thumb(prepared)
     meta = prepared.to_meta(size)
     meta["mtime"] = prepared.dest.stat().st_mtime if prepared.dest.exists() else time.time()
@@ -367,7 +412,9 @@ def run_one(job: dict[str, Any]) -> None:
     folder = out_dir()
     update_job(job_id, status="resolving", stage="解析中", percent=0)
     try:
-        if source.startswith("http") and "video.twimg.com" in source:
+        if source.startswith("http") and xdl.is_archives_url(source):
+            prepared_list = xdl.prepare_archive_downloads(source, folder, skip_existing=True)
+        elif source.startswith("http") and "video.twimg.com" in source:
             prepared_list = [xdl.prepare_cdn_download(source, folder, skip_existing=True)]
         else:
             prepared_list = xdl.prepare_tweet_downloads(source, folder, quality, skip_existing=True)
@@ -387,10 +434,11 @@ def run_one(job: dict[str, Any]) -> None:
         text=primary.text,
         filename=primary.dest.name,
         duration=primary.duration,
-        quality=f"{primary.fmt.height}p" if primary.fmt.height else quality,
+        quality=f"{primary.fmt.height}p" if primary.fmt.height else ("HLS" if xdl.is_hls_url(primary.fmt.url) else quality),
     )
 
     total_items = len(prepared_list)
+    item_errors: list[str] = []
     for index, prepared in enumerate(prepared_list, 1):
         if job_cancelled(job_id):
             update_job(job_id, status="cancelled", stage="已取消")
@@ -400,7 +448,7 @@ def run_one(job: dict[str, Any]) -> None:
             job_id,
             filename=prepared.dest.name,
             duration=prepared.duration,
-            quality=f"{prepared.fmt.height}p" if prepared.fmt.height else quality,
+            quality=f"{prepared.fmt.height}p" if prepared.fmt.height else ("HLS" if xdl.is_hls_url(prepared.fmt.url) else quality),
             status="downloading",
             stage="已跳过" if prepared.skipped else stage,
             percent=0,
@@ -408,6 +456,9 @@ def run_one(job: dict[str, Any]) -> None:
         if prepared.skipped:
             finish_item(job_id, prepared, skipped=True, final=(index == total_items))
             continue
+        if xdl.is_archives_url(prepared.source):
+            update_job(job_id, stage="刷新播放地址")
+            prepared = xdl.refresh_archive_prepared(prepared)
         last = {"t": 0.0}
 
         def on_progress(downloaded: int, total: int, speed: float, _last=last) -> None:
@@ -435,6 +486,9 @@ def run_one(job: dict[str, Any]) -> None:
                 on_progress=on_progress,
                 should_cancel=lambda: job_cancelled(job_id),
                 prefer_urllib=True,
+                referer=prepared.source if xdl.is_archives_url(prepared.source) else "",
+                on_stage=lambda s: update_job(job_id, stage=s, status="downloading"),
+                alt_urls=getattr(prepared, "alt_urls", None),
             )
             finish_item(job_id, prepared, skipped=False, final=(index == total_items))
         except xdl.Cancelled:
@@ -446,8 +500,22 @@ def run_one(job: dict[str, Any]) -> None:
             update_job(job_id, status="cancelled", stage="已取消")
             return
         except Exception as err:
-            update_job(job_id, status="error", stage="失败", error=str(err))
-            return
+            item_errors.append(f"{prepared.dest.name}: {err}")
+            if index < total_items:
+                update_job(job_id, error=str(err), stage=f"第 {index} 段失败，继续下一段")
+                continue
+            break
+    if item_errors:
+        done_ok = total_items - len(item_errors)
+        if done_ok > 0:
+            update_job(
+                job_id,
+                status="error",
+                stage=f"完成 {done_ok}/{total_items} 段",
+                error="；".join(item_errors),
+            )
+        else:
+            update_job(job_id, status="error", stage="失败", error="；".join(item_errors))
 
 
 def worker_loop() -> None:
@@ -472,7 +540,7 @@ def worker_loop() -> None:
 def enqueue(text: str, quality: str) -> list[dict[str, Any]]:
     items = xdl.extract_all_inputs(text)
     if not items:
-        raise ValueError("没有识别到推文链接或 ID")
+        raise ValueError("没有识别到推文链接、ID 或 archives 页面")
     created = [new_job(item, quality) for item in items]
     return created
 
@@ -803,7 +871,7 @@ def serve(port: int = 8787, out_dir_value: str = "downloads", proxy: Optional[st
         raise RuntimeError(f"无法绑定端口 {port}: {last_err}")
 
     url = f"http://127.0.0.1:{bound}"
-    log(f"X 视频下载器  {url}")
+    log(f"视频下载器    {url}")
     log(f"保存目录      {out_dir()}")
     log(f"代理          {xdl.proxy_status()['label']}")
     threading.Timer(0.6, lambda: webbrowser.open(url)).start()
