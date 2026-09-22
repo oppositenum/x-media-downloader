@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>X 视频下载器</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23fff'/%3E%3Ctext x='16' y='23' text-anchor='middle' font-size='18' font-family='system-ui' font-weight='800'%3EX%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="logo" aria-hidden="true">X</span>
+          <div>
+            <h1>视频下载器</h1>
+            <p>敏感帖也能下 · 本地播放</p>
+          </div>
+        </div>
+        <div class="top-actions">
+          <button id="pickDir" class="ghost" type="button" title="选择保存目录">目录</button>
+          <span id="outDir" class="path" title="保存目录">—</span>
+          <button id="openDir" class="ghost" type="button">在访达中显示</button>
+        </div>
+      </header>
+
+      <div class="workspace">
+        <section class="pane pane-left">
+          <div class="composer">
+            <label class="sr" for="urls">推文链接</label>
+            <textarea
+              id="urls"
+              rows="5"
+              placeholder="粘贴 X / Twitter 链接，一行一条，也可一次贴一整段文字"
+            ></textarea>
+            <div class="composer-row">
+              <label class="field">
+                清晰度
+                <select id="quality">
+                  <option value="best">最高</option>
+                  <option value="1440">1440p</option>
+                  <option value="1080">1080p</option>
+                  <option value="720">720p</option>
+                  <option value="360">360p</option>
+                  <option value="270">270p</option>
+                </select>
+              </label>
+              <button id="download" class="primary" type="button">开始下载</button>
+            </div>
+            <div class="proxy-row">
+              <label class="field grow">
+                下载代理
+                <input
+                  id="proxy"
+                  type="text"
+                  spellcheck="false"
+                  autocomplete="off"
+                  placeholder="system / direct / http://127.0.0.1:7890"
+                />
+              </label>
+              <button id="proxyApply" class="ghost" type="button">保存</button>
+              <button id="proxyTest" class="ghost" type="button">测试</button>
+            </div>
+            <p id="proxyStatus" class="proxy-status">当前：系统环境</p>
+            <p id="composerHint" class="hint"></p>
+          </div>
+
+          <div class="section-head">
+            <h2>任务</h2>
+            <button id="clearDone" class="text-btn" type="button">清除已完成</button>
+          </div>
+          <div id="jobs" class="jobs"></div>
+          <p id="jobsEmpty" class="empty">还没有任务。贴一条推文链接开始。</p>
+        </section>
+
+        <section class="pane pane-right">
+          <div class="section-head">
+            <h2>已下载</h2>
+            <input id="search" type="search" placeholder="搜索作者 / 文案 / ID" />
+          </div>
+          <div id="library" class="library"></div>
+          <p id="libEmpty" class="empty">这里会列出下过的视频，点封面就能播放。</p>
+        </section>
+      </div>
+    </div>
+
+    <div id="player" class="player hidden" hidden>
+      <div class="player-backdrop" data-close="1"></div>
+      <div class="player-sheet">
+        <div class="player-head">
+          <div class="player-meta">
+            <strong id="playerTitle">—</strong>
+            <span id="playerSub"></span>
+          </div>
+          <div class="player-actions">
+            <button id="playerReveal" class="ghost" type="button">访达</button>
+            <button id="playerClose" class="ghost" type="button">关闭</button>
+          </div>
+        </div>
+        <video id="video" controls playsinline></video>
+      </div>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

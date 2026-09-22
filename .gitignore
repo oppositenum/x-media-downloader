@@ -1,0 +1,8 @@
+downloads/
+.thumbs/
+.xdl-library.json
+.xdl-settings.json
+*.mp4
+__pycache__/
+*.pyc
+.DS_Store
