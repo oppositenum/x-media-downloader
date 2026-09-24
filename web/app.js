@@ -221,7 +221,7 @@ $("download").addEventListener("click", async () => {
   const text = $("urls").value.trim();
   $("composerHint").textContent = "";
   if (!text) {
-    $("composerHint").textContent = "先贴一条推文、黑料网或海角网 archives 链接。";
+    $("composerHint").textContent = "先贴一条推文、archives 或 eve568 播放链接。";
     return;
   }
   $("download").disabled = true;

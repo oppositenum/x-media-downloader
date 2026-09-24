@@ -35,6 +35,12 @@ settings = {
     "out_dir": str(DEFAULT_OUT),
     "quality": "best",
     "proxy": "system",
+    "eve568_u": "",
+    "eve568_n": "",
+    "eve568_s": "",
+    "eve568_origin": "",
+    "xh_login_id": "a10006",
+    "xh_password": "Aa11221122",
 }
 worker_busy = False
 stop_worker = threading.Event()
@@ -74,6 +80,11 @@ def public_settings() -> dict[str, Any]:
         "proxy_mode": proxy["mode"],
         "proxy_env": proxy["env"],
         "proxy_label": proxy["label"],
+        "eve568_u": settings.get("eve568_u") or "",
+        "eve568_n": settings.get("eve568_n") or "",
+        "eve568_s": settings.get("eve568_s") or "",
+        "eve568_origin": settings.get("eve568_origin") or "",
+        "xh_login_id": settings.get("xh_login_id") or "",
     }
 
 
@@ -82,8 +93,24 @@ def persist_settings() -> None:
         "out_dir": settings["out_dir"],
         "quality": settings["quality"],
         "proxy": settings["proxy"],
+        "eve568_u": settings.get("eve568_u") or "",
+        "eve568_n": settings.get("eve568_n") or "",
+        "eve568_s": settings.get("eve568_s") or "",
+        "eve568_origin": settings.get("eve568_origin") or "",
+        "xh_login_id": settings.get("xh_login_id") or "",
+        "xh_password": settings.get("xh_password") or "",
     }
     settings_path().write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _persist_eve568_creds(creds: dict) -> None:
+    if creds.get("u"):
+        settings["eve568_u"] = str(creds.get("u") or "")
+        settings["eve568_n"] = str(creds.get("n") or "")
+        settings["eve568_s"] = str(creds.get("s") or "")
+        if creds.get("origin"):
+            settings["eve568_origin"] = str(creds.get("origin") or "")
+        persist_settings()
 
 
 def apply_proxy(value: str) -> dict[str, Any]:
@@ -105,6 +132,23 @@ def load_persisted_settings(cli_out: Optional[str] = None, cli_proxy: Optional[s
             saved = {}
     if saved.get("quality"):
         settings["quality"] = str(saved["quality"])
+    for key in ("eve568_u", "eve568_n", "eve568_s", "eve568_origin", "xh_login_id", "xh_password"):
+        if saved.get(key):
+            settings[key] = str(saved[key])
+    xdl.set_eve568_account(
+        login_id=settings.get("xh_login_id") or "",
+        password=settings.get("xh_password") or "",
+    )
+    xdl.set_eve568_cred_listener(_persist_eve568_creds)
+    if settings.get("eve568_u") and settings.get("eve568_n") and settings.get("eve568_s"):
+        xdl.set_eve568_creds(
+            {
+                "u": settings.get("eve568_u") or "",
+                "n": settings.get("eve568_n") or "",
+                "s": settings.get("eve568_s") or "",
+                "origin": settings.get("eve568_origin") or "",
+            }
+        )
     if cli_out:
         settings["out_dir"] = str(Path(cli_out).expanduser())
     elif saved.get("out_dir"):
@@ -412,7 +456,9 @@ def run_one(job: dict[str, Any]) -> None:
     folder = out_dir()
     update_job(job_id, status="resolving", stage="解析中", percent=0)
     try:
-        if source.startswith("http") and xdl.is_archives_url(source):
+        if source.startswith("http") and xdl.is_eve568_play_url(source):
+            prepared_list = xdl.prepare_eve568_downloads(source, folder, skip_existing=True)
+        elif source.startswith("http") and xdl.is_archives_url(source):
             prepared_list = xdl.prepare_archive_downloads(source, folder, skip_existing=True)
         elif source.startswith("http") and "video.twimg.com" in source:
             prepared_list = [xdl.prepare_cdn_download(source, folder, skip_existing=True)]
@@ -459,6 +505,9 @@ def run_one(job: dict[str, Any]) -> None:
         if xdl.is_archives_url(prepared.source):
             update_job(job_id, stage="刷新播放地址")
             prepared = xdl.refresh_archive_prepared(prepared)
+        if xdl.is_eve568_play_url(prepared.source):
+            update_job(job_id, stage="刷新播放地址")
+            prepared.fmt.url = xdl.refresh_eve568_media_url(prepared.source)
         last = {"t": 0.0}
 
         def on_progress(downloaded: int, total: int, speed: float, _last=last) -> None:
@@ -480,16 +529,26 @@ def run_one(job: dict[str, Any]) -> None:
             )
 
         try:
-            xdl.download_url(
-                prepared.fmt.url,
-                prepared.dest,
-                on_progress=on_progress,
-                should_cancel=lambda: job_cancelled(job_id),
-                prefer_urllib=True,
-                referer=prepared.source if xdl.is_archives_url(prepared.source) else "",
-                on_stage=lambda s: update_job(job_id, stage=s, status="downloading"),
-                alt_urls=getattr(prepared, "alt_urls", None),
-            )
+            if xdl.is_eve568_play_url(prepared.source):
+                xdl.download_with_urllib(
+                    prepared.fmt.url,
+                    prepared.dest,
+                    on_progress=on_progress,
+                    should_cancel=lambda: job_cancelled(job_id),
+                    referer=prepared.source,
+                    refresh_url=lambda src=prepared.source: xdl.refresh_eve568_media_url(src),
+                )
+            else:
+                xdl.download_url(
+                    prepared.fmt.url,
+                    prepared.dest,
+                    on_progress=on_progress,
+                    should_cancel=lambda: job_cancelled(job_id),
+                    prefer_urllib=True,
+                    referer=prepared.source if xdl.is_archives_url(prepared.source) else "",
+                    on_stage=lambda s: update_job(job_id, stage=s, status="downloading"),
+                    alt_urls=getattr(prepared, "alt_urls", None),
+                )
             finish_item(job_id, prepared, skipped=False, final=(index == total_items))
         except xdl.Cancelled:
             if prepared.dest.exists():
@@ -540,7 +599,7 @@ def worker_loop() -> None:
 def enqueue(text: str, quality: str) -> list[dict[str, Any]]:
     items = xdl.extract_all_inputs(text)
     if not items:
-        raise ValueError("没有识别到推文链接、ID 或 archives 页面")
+        raise ValueError("没有识别到推文链接、ID、archives 或 eve568 播放页")
     created = [new_job(item, quality) for item in items]
     return created
 
@@ -649,7 +708,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/download":
                 quality = (data.get("quality") or settings["quality"] or "best").strip()
-                created = enqueue(data.get("text") or "", quality)
+                text = data.get("text") or ""
+                found = xdl.remember_eve568_creds_from_text(text)
+                if found.get("u"):
+                    _persist_eve568_creds(found)
+                created = enqueue(text, quality)
                 status, body, ctype = json_bytes({"ok": True, "jobs": created})
                 return self._send(status, body, ctype)
             if path == "/api/cancel":
@@ -678,6 +741,22 @@ class Handler(BaseHTTPRequestHandler):
                     settings["quality"] = str(data["quality"])
                 if "proxy" in data:
                     apply_proxy(str(data.get("proxy") or "system"))
+                for key in ("eve568_u", "eve568_n", "eve568_s", "eve568_origin", "xh_login_id", "xh_password"):
+                    if key in data:
+                        settings[key] = str(data.get(key) or "")
+                xdl.set_eve568_account(
+                    login_id=settings.get("xh_login_id") or "",
+                    password=settings.get("xh_password") or "",
+                )
+                if settings.get("eve568_u") and settings.get("eve568_n") and settings.get("eve568_s"):
+                    xdl.set_eve568_creds(
+                        {
+                            "u": settings.get("eve568_u") or "",
+                            "n": settings.get("eve568_n") or "",
+                            "s": settings.get("eve568_s") or "",
+                            "origin": settings.get("eve568_origin") or "",
+                        }
+                    )
                 persist_settings()
                 status, body, ctype = json_bytes({"ok": True, "settings": public_settings()})
                 return self._send(status, body, ctype)

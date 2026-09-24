@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download videos from X / Twitter and Heiliao/Haijiao /archives/ pages.
+"""Download videos from X / Twitter, Heiliao/Haijiao /archives/, and eve568.
 
 yt-dlp's guest GraphQL often returns TweetTombstone for NSFW tweets.
 This tool resolves media via the FxTwitter / VxTwitter embed APIs, then
@@ -8,6 +8,9 @@ downloads the chosen MP4 with yt-dlp (or urllib if yt-dlp is missing).
 Archives pages embed AES-128 HLS in DPlayer; those playlists are decrypted
 and remuxed to MP4. Haijiao permanent hosts need a browser TLS fingerprint
 and usually a local proxy (Cloudflare RST on direct connect).
+
+eve568 play pages need a portal login (u/n/s). The API then returns a
+COS-signed MP4 that expires in about 15 minutes.
 """
 
 from __future__ import annotations
@@ -29,6 +32,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Optional
+
+XH_GET_VIDEO_URL = Path("/Volumes/xinba/10_Projects/Active/oppositenum/xh/get_video_url.py")
+XH_DEFAULT_LOGIN_ID = "a10006"
+XH_DEFAULT_PASSWORD = "Aa11221122"
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -54,6 +61,17 @@ HAIJIAO_HOST_RE = re.compile(
     r"(?:^|\.)(?:hjw\d+|hjwang\d+|haijiao(?:wang)?|haijw)\.(?:com|cc|net|app)$",
     re.I,
 )
+EVE568_PLAY_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?([a-zA-Z0-9.-]+)/v/"
+    r"(adult-long-video|adult-short-video|movie|tv)/play/"
+    r"([a-fA-F0-9]{24})(?:\?[^\s\"'<>]*)?",
+    re.I,
+)
+EVE568_PORTAL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?([a-zA-Z0-9.-]+)/v(?:/|\?(?:[^\s\"'<>]*))?",
+    re.I,
+)
+EVE568_HOST_RE = re.compile(r"(?:^|\.)eve568\.com$", re.I)
 DIM_RE = re.compile(r"/(\d+)x(\d+)/")
 HLS_WORKERS = 4
 HLS_SEGMENT_RETRIES = 6
@@ -83,6 +101,17 @@ _proxy_lock = threading.Lock()
 _proxy_mode = "system"  # system | direct | explicit
 _proxy_url = ""
 _opener = urllib.request.build_opener()
+_eve568_lock = threading.Lock()
+_eve568_jwt = ""
+_eve568_jwt_exp = 0.0
+_eve568_creds: dict[str, str] = {}
+_eve568_account: dict[str, str] = {
+    "login_id": XH_DEFAULT_LOGIN_ID,
+    "password": XH_DEFAULT_PASSWORD,
+    "script": str(XH_GET_VIDEO_URL),
+}
+_eve568_refresh_lock = threading.Lock()
+_eve568_cred_listener: Optional[Callable[[dict], None]] = None
 
 
 class Cancelled(Exception):
@@ -370,8 +399,56 @@ def is_haijiao_host(host: str) -> bool:
     return bool(HAIJIAO_HOST_RE.search(host))
 
 
+def is_eve568_host(host: str) -> bool:
+    host = (host or "").strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return bool(EVE568_HOST_RE.search(host))
+
+
+def normalize_eve568_play_url(raw: str) -> str:
+    m = EVE568_PLAY_RE.search(raw or "")
+    if not m:
+        return (raw or "").strip()
+    host, kind, video_id = m.group(1), m.group(2), m.group(3)
+    scheme = "https"
+    if (raw or "").lower().startswith("http://"):
+        scheme = "http"
+    return f"{scheme}://{host}/v/{kind}/play/{video_id}"
+
+
+def is_eve568_play_url(value: str) -> bool:
+    return bool(EVE568_PLAY_RE.search(value or ""))
+
+
+def eve568_query_creds(url: str) -> dict[str, str]:
+    parsed = urllib.parse.urlparse(url if "://" in (url or "") else "https://" + (url or ""))
+    query = urllib.parse.parse_qs(parsed.query)
+    out: dict[str, str] = {}
+    for key in ("u", "n", "s"):
+        values = query.get(key) or []
+        if values and values[0]:
+            out[key] = values[0]
+    return out
+
+
+def remember_eve568_creds_from_text(text: str) -> dict[str, str]:
+    found: dict[str, str] = {}
+    for raw in re.findall(r"https?://[^\s\"'<>]+", text or ""):
+        creds = eve568_query_creds(raw)
+        if {"u", "n", "s"} <= set(creds):
+            found = creds
+            host = urllib.parse.urlparse(raw).hostname or ""
+            if is_eve568_host(host):
+                found["origin"] = f"{urllib.parse.urlparse(raw).scheme or 'https'}://{host}"
+    if found:
+        set_eve568_creds(found)
+    return found
+
+
 def extract_all_inputs(text: str) -> list[str]:
-    """Pull tweet ids, CDN urls, and archives pages."""
+    """Pull tweet ids, CDN urls, archives pages, and eve568 play urls."""
+    remember_eve568_creds_from_text(text)
     items: list[str] = []
     seen: set[str] = set()
 
@@ -380,6 +457,8 @@ def extract_all_inputs(text: str) -> list[str]:
             seen.add(item)
             items.append(item)
 
+    for m in EVE568_PLAY_RE.finditer(text or ""):
+        add(normalize_eve568_play_url(m.group(0)))
     for m in ARCHIVES_URL_RE.finditer(text or ""):
         add(normalize_archives_url(m.group(1), m.group(2)))
     for m in TWEET_URL_RE.finditer(text or ""):
@@ -602,21 +681,76 @@ def download_with_urllib(
     dest: Path,
     on_progress: Optional[ProgressCb] = None,
     should_cancel: Optional[CancelFn] = None,
+    referer: str = "",
+    refresh_url: Optional[Callable[[], str]] = None,
 ) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".part")
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urlopen(req, timeout=60) as resp:
-            total = int(resp.headers.get("Content-Length") or 0)
-            downloaded = 0
-            started = time.time()
-            last_emit = 0.0
-            with open(part, "wb") as fh:
+    downloaded = part.stat().st_size if part.exists() else 0
+    started = time.time()
+    last_emit = 0.0
+    last_refresh = time.time()
+    current = url
+    total = 0
+    attempts = 0
+    while True:
+        if should_cancel and should_cancel():
+            raise Cancelled("已取消")
+        headers = _request_headers(referer)
+        if downloaded > 0:
+            headers["Range"] = f"bytes={downloaded}-"
+        req = urllib.request.Request(current, headers=headers)
+        try:
+            resp = urlopen(req, timeout=60)
+        except urllib.error.HTTPError as err:
+            if err.code in {401, 403, 404} and refresh_url and attempts < 8:
+                current = refresh_url()
+                last_refresh = time.time()
+                attempts += 1
+                time.sleep(0.4)
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError, ConnectionResetError, BrokenPipeError, OSError):
+            attempts += 1
+            if attempts > 30:
+                raise RuntimeError("下载中断次数过多")
+            time.sleep(0.6)
+            if refresh_url:
+                current = refresh_url()
+                last_refresh = time.time()
+            continue
+        restart = False
+        with resp:
+            code = getattr(resp, "status", None) or resp.getcode()
+            length = int(resp.headers.get("Content-Length") or 0)
+            content_range = resp.headers.get("Content-Range") or ""
+            if code == 206:
+                if content_range and "/" in content_range:
+                    try:
+                        total = int(content_range.rsplit("/", 1)[1])
+                    except ValueError:
+                        total = downloaded + length
+                else:
+                    total = downloaded + length
+                mode = "ab"
+            else:
+                downloaded = 0
+                total = length
+                mode = "wb"
+            with open(part, mode) as fh:
                 while True:
                     if should_cancel and should_cancel():
                         raise Cancelled("已取消")
-                    chunk = resp.read(1024 * 256)
+                    if refresh_url and time.time() - last_refresh > 480:
+                        current = refresh_url()
+                        last_refresh = time.time()
+                        restart = True
+                        break
+                    try:
+                        chunk = resp.read(1024 * 256)
+                    except (urllib.error.URLError, TimeoutError, ConnectionResetError, BrokenPipeError, OSError):
+                        restart = True
+                        break
                     if not chunk:
                         break
                     fh.write(chunk)
@@ -624,33 +758,28 @@ def download_with_urllib(
                     now = time.time()
                     elapsed = max(now - started, 0.001)
                     speed = downloaded / elapsed
-                    if on_progress and (now - last_emit >= 0.2 or downloaded == total):
+                    if on_progress and (now - last_emit >= 0.2 or (total and downloaded >= total)):
                         on_progress(downloaded, total, speed)
                         last_emit = now
-                    if sys.stderr.isatty() and total and now - last_emit >= 0.2:
-                        pct = downloaded * 100 / total if total else 0
-                        eta = (total - downloaded) / speed if speed else 0
-                        eprint(
-                            f"\r[{pct:5.1f}%] {downloaded / 1048576:7.1f}/{total / 1048576:.1f} MiB  "
-                            f"{speed / 1048576:5.1f} MiB/s  ETA {format_duration(eta)}",
-                            end="",
-                        )
-        if sys.stderr.isatty() and total:
-            eprint("")
-        if on_progress:
-            on_progress(downloaded, total or downloaded, 0.0)
-        part.replace(dest)
-    except Cancelled:
-        if part.exists():
-            part.unlink()
-        raise
-    except Exception:
-        if part.exists():
-            try:
-                part.unlink()
-            except OSError:
-                pass
-        raise
+        if restart:
+            continue
+        if total and downloaded >= total:
+            part.replace(dest)
+            if on_progress:
+                on_progress(downloaded, total, 0.0)
+            return
+        if downloaded > 0 and not total:
+            part.replace(dest)
+            if on_progress:
+                on_progress(downloaded, downloaded, 0.0)
+            return
+        attempts += 1
+        if attempts > 30:
+            raise RuntimeError("下载中断次数过多")
+        time.sleep(0.6)
+        if refresh_url:
+            current = refresh_url()
+            last_refresh = time.time()
 
 
 def save_url_to_file(url: str, dest: Path, timeout: float = 20.0) -> bool:
@@ -707,7 +836,13 @@ def download_url(
         )
         return
     if prefer_urllib or on_progress or should_cancel or not yt_dlp_path():
-        download_with_urllib(url, dest, on_progress=on_progress, should_cancel=should_cancel)
+        download_with_urllib(
+            url,
+            dest,
+            on_progress=on_progress,
+            should_cancel=should_cancel,
+            referer=referer,
+        )
         return
     download_with_ytdlp(url, dest)
 
@@ -1600,6 +1735,358 @@ def process_archive(page_url: str, out_dir: Path, info_only: bool, skip_existing
     return errors
 
 
+def set_eve568_cred_listener(fn: Optional[Callable[[dict], None]]) -> None:
+    global _eve568_cred_listener
+    _eve568_cred_listener = fn
+
+
+def set_eve568_account(
+    login_id: str = "",
+    password: str = "",
+    script: str = "",
+) -> dict[str, str]:
+    with _eve568_lock:
+        if login_id:
+            _eve568_account["login_id"] = login_id.strip()
+        if password:
+            _eve568_account["password"] = password
+        if script:
+            _eve568_account["script"] = script.strip()
+        return dict(_eve568_account)
+
+
+def eve568_account() -> dict[str, str]:
+    with _eve568_lock:
+        return dict(_eve568_account)
+
+
+def set_eve568_creds(creds: dict[str, str]) -> dict[str, str]:
+    global _eve568_jwt, _eve568_jwt_exp
+    cleaned = {
+        "u": (creds.get("u") or "").strip(),
+        "n": (creds.get("n") or "").strip(),
+        "s": (creds.get("s") or "").strip(),
+        "origin": (creds.get("origin") or "").strip(),
+    }
+    with _eve568_lock:
+        changed = any(cleaned[k] and cleaned[k] != _eve568_creds.get(k) for k in ("u", "n", "s"))
+        for key, value in cleaned.items():
+            if value:
+                _eve568_creds[key] = value
+        if changed:
+            _eve568_jwt = ""
+            _eve568_jwt_exp = 0.0
+        snapshot = dict(_eve568_creds)
+    listener = _eve568_cred_listener
+    if listener and snapshot.get("u"):
+        try:
+            listener(snapshot)
+        except Exception:
+            pass
+    return snapshot
+
+
+def eve568_creds() -> dict[str, str]:
+    with _eve568_lock:
+        return dict(_eve568_creds)
+
+
+def eve568_origin(page_url: str = "") -> str:
+    creds = eve568_creds()
+    if creds.get("origin"):
+        return creds["origin"]
+    parsed = urllib.parse.urlparse(page_url or "")
+    host = parsed.netloc
+    if host:
+        return f"{parsed.scheme or 'http'}://{host}"
+    return "http://pk.eve568.com"
+
+
+def eve568_api(origin: str, path: str) -> str:
+    return urllib.parse.urljoin(origin.rstrip("/") + "/", "api/v1/" + path.lstrip("/"))
+
+
+def _jwt_exp(token: str) -> float:
+    try:
+        payload = token.split(".")[1]
+        pad = "=" * (-len(payload) % 4)
+        data = json.loads(__import__("base64").urlsafe_b64decode(payload + pad))
+        return float(data.get("exp") or 0)
+    except Exception:
+        return 0.0
+
+
+def http_request_json(
+    url: str,
+    method: str = "GET",
+    payload: Optional[dict] = None,
+    headers: Optional[dict] = None,
+    timeout: float = 20.0,
+):
+    req_headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+    if headers:
+        req_headers.update(headers)
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        req_headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as err:
+        body = err.read() if err.fp else b""
+        text = body.decode("utf-8", "replace")[:240]
+        raise RuntimeError(f"HTTP {err.code}: {text or url}") from err
+    if not body:
+        return {}
+    try:
+        return json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError as err:
+        raise RuntimeError(f"接口不是 JSON: {url}") from err
+
+
+def _eve568_auth_failed(err: Exception) -> bool:
+    text = str(err)
+    needles = (
+        "HTTP 401",
+        "HTTP 403",
+        "HTTP 404",
+        "HTTP 422",
+        "HTTP 500",
+        "HTTP 502",
+        "userId",
+        "秘文不存在",
+        "certificate not found",
+        "没有返回 token",
+        "入口链接可能已过期",
+        "需要门户登录",
+    )
+    return any(item in text for item in needles)
+
+
+def refresh_eve568_portal(origin: str = "") -> dict[str, str]:
+    """Call xh/get_video_url.py to mint a fresh u/n/s portal URL."""
+    account = eve568_account()
+    script = Path(account.get("script") or XH_GET_VIDEO_URL)
+    if not script.is_file():
+        raise RuntimeError(f"找不到 xh 入口脚本: {script}")
+    cmd = [
+        sys.executable,
+        str(script),
+        "--login-id",
+        account.get("login_id") or XH_DEFAULT_LOGIN_ID,
+        "--password",
+        account.get("password") or XH_DEFAULT_PASSWORD,
+        "--no-prompt",
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+    stdout = (proc.stdout or b"").decode("utf-8", "replace").strip()
+    stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()
+    if proc.returncode != 0:
+        raise RuntimeError(f"刷新 eve568 入口失败: {stderr[-400:] or stdout[-400:] or proc.returncode}")
+    url = ""
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if "u=" in line and "n=" in line and "s=" in line:
+            url = line
+            break
+    if not url:
+        raise RuntimeError(f"xh 脚本没有返回带 u/n/s 的入口链接: {stdout[-300:]}")
+    found = remember_eve568_creds_from_text(url)
+    if origin and not found.get("origin"):
+        found = set_eve568_creds({**found, "origin": origin})
+    if not found.get("u"):
+        raise RuntimeError("xh 脚本返回的入口链接解析不出 u/n/s")
+    return found
+
+
+def eve568_login(origin: str = "", creds: Optional[dict[str, str]] = None, refresh: bool = False) -> str:
+    global _eve568_jwt, _eve568_jwt_exp
+    origin = origin or eve568_origin()
+    if refresh:
+        refresh_eve568_portal(origin)
+    data = creds or eve568_creds()
+    u, n, s = data.get("u") or "", data.get("n") or "", data.get("s") or ""
+    if not (u and n and s):
+        refresh_eve568_portal(origin)
+        data = eve568_creds()
+        u, n, s = data.get("u") or "", data.get("n") or "", data.get("s") or ""
+    if not (u and n and s):
+        raise RuntimeError("eve568 需要门户登录参数，xh 脚本也没有拿到 u/n/s")
+    try:
+        payload = http_request_json(
+            eve568_api(origin, "login"),
+            method="POST",
+            payload={"u": u, "n": n, "s": s},
+            headers={"Origin": origin, "Referer": origin + "/"},
+        )
+    except Exception as err:
+        if refresh or not _eve568_auth_failed(err):
+            raise
+        refresh_eve568_portal(origin)
+        data = eve568_creds()
+        payload = http_request_json(
+            eve568_api(origin, "login"),
+            method="POST",
+            payload={"u": data.get("u"), "n": data.get("n"), "s": data.get("s")},
+            headers={"Origin": origin, "Referer": origin + "/"},
+        )
+    token = ""
+    if isinstance(payload, dict):
+        token = str(payload.get("token") or "")
+        inner = payload.get("data")
+        if not token and isinstance(inner, dict):
+            token = str(inner.get("token") or "")
+    if not token:
+        if refresh:
+            raise RuntimeError("eve568 登录没有返回 token，入口链接可能已过期")
+        return eve568_login(origin, refresh=True)
+    with _eve568_lock:
+        _eve568_jwt = token
+        _eve568_jwt_exp = _jwt_exp(token)
+    return token
+
+
+def eve568_token(origin: str = "", force: bool = False, refresh_portal: bool = False) -> str:
+    origin = origin or eve568_origin()
+    with _eve568_lock:
+        token = _eve568_jwt
+        exp = _eve568_jwt_exp
+    now = time.time()
+    if not force and not refresh_portal and token and (not exp or exp - now >= 600):
+        return token
+    with _eve568_refresh_lock:
+        with _eve568_lock:
+            token = _eve568_jwt
+            exp = _eve568_jwt_exp
+        now = time.time()
+        if not force and not refresh_portal and token and (not exp or exp - now >= 600):
+            return token
+        return eve568_login(origin, refresh=refresh_portal)
+
+
+def fetch_eve568_detail(origin: str, video_id: str) -> dict:
+    token = eve568_token(origin)
+    headers = {
+        "Origin": origin,
+        "Referer": origin + "/",
+        "Authorization": f"Bearer {token}",
+    }
+    try:
+        data = http_request_json(eve568_api(origin, f"videos/id={video_id}"), headers=headers)
+    except Exception as err:
+        if not _eve568_auth_failed(err):
+            raise
+        token = eve568_token(origin, force=True, refresh_portal=True)
+        headers["Authorization"] = f"Bearer {token}"
+        data = http_request_json(eve568_api(origin, f"videos/id={video_id}"), headers=headers)
+    if not isinstance(data, dict):
+        raise RuntimeError("eve568 详情格式异常")
+    detail = data.get("data") if isinstance(data.get("data"), dict) else data
+    if not isinstance(detail, dict) or not detail.get("videoPath"):
+        raise RuntimeError("eve568 详情里没有播放地址")
+    return detail
+
+
+def join_eve568_media(cdn_url: str, path: str) -> str:
+    path = (path or "").strip()
+    if not path:
+        return ""
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    base = (cdn_url or "").rstrip("/")
+    if not base:
+        return path
+    return base + "/" + path.lstrip("/")
+
+
+def refresh_eve568_media_url(page_url: str) -> str:
+    m = EVE568_PLAY_RE.search(page_url)
+    if not m:
+        raise RuntimeError("无法识别 eve568 播放链接")
+    origin = eve568_origin(page_url)
+    detail = fetch_eve568_detail(origin, m.group(3))
+    return str(detail.get("videoPath") or "")
+
+
+def prepare_eve568_downloads(
+    page_url: str,
+    out_dir: Path,
+    skip_existing: bool = True,
+) -> list[PreparedDownload]:
+    m = EVE568_PLAY_RE.search(page_url)
+    if not m:
+        raise RuntimeError("无法识别 eve568 播放链接")
+    host, kind, video_id = m.group(1), m.group(2), m.group(3)
+    origin = eve568_origin(page_url)
+    remember_eve568_creds_from_text(page_url)
+    detail = fetch_eve568_detail(origin, video_id)
+    media = str(detail.get("videoPath") or "")
+    if not media:
+        raise RuntimeError("eve568 详情里没有 videoPath")
+    author = ""
+    actors = detail.get("actorNames") or []
+    if isinstance(actors, list) and actors:
+        author = str(actors[0] or "")
+    author = author or str(detail.get("manufacturer") or "eve568")
+    title = str(detail.get("name") or video_id)
+    thumb = str(detail.get("coverImage2") or detail.get("coverImage1") or "")
+    duration = float(detail.get("watchTime") or detail.get("duration") or 0)
+    fmt = VideoFormat(url=media, container="mp4" if not is_hls_url(media) else "m3u8")
+    dest = out_dir / (safe_filename(f"{author}-{video_id}") + ".mp4")
+    source = f"{origin}/v/{kind}/play/{video_id}"
+    return [
+        PreparedDownload(
+            tweet_id=video_id,
+            media_id=kind,
+            author=author,
+            text=str(detail.get("description") or title),
+            duration=duration,
+            thumbnail=thumb,
+            fmt=fmt,
+            dest=dest,
+            source=source,
+            skipped=bool(skip_existing and dest.exists() and dest.stat().st_size > 0),
+        )
+    ]
+
+
+def process_eve568(page_url: str, out_dir: Path, info_only: bool, skip_existing: bool) -> int:
+    prepared = prepare_eve568_downloads(page_url, out_dir, skip_existing=skip_existing)
+    if info_only:
+        for item in prepared:
+            say(
+                f"{item.author}/{item.tweet_id}  {format_duration(item.duration)}  "
+                f"{item.text.replace(chr(10), ' ')[:80]}"
+            )
+            say(f"  1. {item.fmt.label}  {item.fmt.url[:80]}")
+        return 0
+    errors = 0
+    for item in prepared:
+        if item.skipped:
+            say(f"已存在，跳过  {item.dest.name}")
+            continue
+        say(f"↓ {item.author}  {item.tweet_id}  {item.fmt.label}  -> {item.dest.name}")
+        try:
+            download_with_urllib(
+                item.fmt.url,
+                item.dest,
+                referer=item.source,
+                refresh_url=lambda src=item.source: refresh_eve568_media_url(src),
+            )
+            size_mb = item.dest.stat().st_size / 1048576
+            say(f"✓ {item.dest}  {size_mb:.1f} MB")
+        except Exception as err:
+            errors += 1
+            eprint(f"✗ {page_url}: {err}")
+    return errors
+
+
 def print_info(video: TweetVideo, chosen: Optional[VideoFormat] = None) -> None:
     preview = video.text.replace("\n", " ")
     if len(preview) > 80:
@@ -1707,9 +2194,9 @@ def process_tweet(
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="xdl",
-        description="从 X/Twitter、黑料网或海角网 archives 页下载视频。支持帖子链接、纯 ID、archives 链接、批量文件。",
+        description="从 X/Twitter、黑料网、海角网 archives 或 eve568 播放页下载视频。",
     )
-    p.add_argument("urls", nargs="*", help="推文链接、数字 ID 或 /archives/ 链接，可多个")
+    p.add_argument("urls", nargs="*", help="推文链接、数字 ID、/archives/ 或 eve568 播放链接，可多个")
     p.add_argument("-f", "--file", help="从文本文件读取链接，一行一条")
     p.add_argument("-o", "--output", default="downloads", help="保存目录（默认 ./downloads）")
     p.add_argument(
@@ -1798,6 +2285,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         eprint("\n示例: xdl.py https://x.com/user/status/123")
         eprint("      xdl.py https://example.com/archives/115738/")
         eprint("      xdl.py --proxy http://127.0.0.1:7890 https://www.hjw01.com/archives/193648/")
+        eprint("      xdl.py 'http://pk.eve568.com/v?u=...&n=...&s=...' http://pk.eve568.com/v/adult-long-video/play/ID")
         eprint("界面:  xdl.py --serve")
         return 2
 
@@ -1808,6 +2296,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     errors = 0
     for item in items:
         try:
+            if item.startswith("http") and is_eve568_play_url(item):
+                errors += process_eve568(
+                    item,
+                    out_dir=out_dir,
+                    info_only=args.info,
+                    skip_existing=not args.no_skip,
+                )
+                continue
             if item.startswith("http") and is_archives_url(item):
                 errors += process_archive(
                     item,

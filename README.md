@@ -4,6 +4,8 @@
 
 也支持黑料网、海角网的 `/archives/` 详情页：页面里的 DPlayer HLS（AES-128）会自动解析、解密、转成 MP4。海角永久站 `hjw01.com` 直连会被 Cloudflare 重置，界面里填本机代理（例如 `http://127.0.0.1:7890`）即可，网页本身免登录。
 
+eve568 播放页（`/v/adult-long-video/play/<id>`）需要门户入口里的 `u`/`n`/`s`。可以直接贴入口链接；入口失效时会调用旁边的 `xh/get_video_url.py`（默认账号 `a10006`）自动换最新入口，再继续抓。CDN 直链大约 15 分钟过期，下载过程中会刷新签名并断点续传。
+
 ## 可视化界面（推荐）
 
 ```bash
@@ -12,7 +14,7 @@ python3 xdl.py --serve
 
 浏览器会打开 `http://127.0.0.1:8787`：
 
-- 左侧粘贴一条或多条推文 / 黑料网 / 海角网 archives 链接，看实时进度（百分比、速度、剩余时间）
+- 左侧粘贴一条或多条推文 / 黑料网 / 海角网 archives / eve568 链接，看实时进度（百分比、速度、剩余时间）
 - 右侧是已下载列表，点封面即可播放
 - 可取消任务、换保存目录、在访达中显示、删除文件
 
@@ -37,6 +39,9 @@ python3 xdl.py "https://l4yh5.pelscmoa.cc/archives/115738/"
 
 # 海角网 archives 页（免登录，永久站走本机代理）
 python3 xdl.py --proxy http://127.0.0.1:7890 "https://www.hjw01.com/archives/193648/"
+
+# eve568：只贴播放页即可；u/n/s 失效时自动跑 xh/get_video_url.py
+python3 xdl.py "http://pk.eve568.com/v/adult-long-video/play/6a3fa82dc427d0001bec92f1"
 
 # 只要 720p
 python3 xdl.py -q 720 "https://x.com/user/status/123"
