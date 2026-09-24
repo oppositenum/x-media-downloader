@@ -230,13 +230,18 @@ def scan_library() -> list[dict[str, Any]]:
     saved = {item.get("filename"): item for item in load_library() if item.get("filename")}
     found: list[dict[str, Any]] = []
     seen = set()
-    for path in sorted(folder.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True):
+    videos = list(folder.glob("*.mp4"))
+    videos.extend(folder.glob("*/*.mp4"))
+    for path in sorted(videos, key=lambda p: p.stat().st_mtime, reverse=True):
         if path.name.startswith("."):
             continue
-        seen.add(path.name)
-        item = dict(saved.get(path.name) or guess_from_filename(path))
+        rel = library_relpath(path)
+        if rel in seen:
+            continue
+        seen.add(rel)
+        item = dict(saved.get(rel) or saved.get(path.name) or guess_from_filename(path))
         stat = path.stat()
-        item["filename"] = path.name
+        item["filename"] = rel
         item["id"] = path.stem
         item["size"] = stat.st_size
         item["mtime"] = stat.st_mtime
@@ -287,11 +292,31 @@ def emit_job(job: dict[str, Any]) -> None:
     publish({"type": "job", "job": public_job(job)})
 
 
-def new_job(source: str, quality: str) -> dict[str, Any]:
+def library_relpath(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(out_dir().resolve())).replace("\\", "/")
+    except ValueError:
+        return path.name
+
+
+def media_path(rel: str) -> Optional[Path]:
+    rel = (rel or "").replace("\\", "/").lstrip("/")
+    if not rel or ".." in Path(rel).parts:
+        return None
+    path = (out_dir() / rel).resolve()
+    try:
+        path.relative_to(out_dir().resolve())
+    except ValueError:
+        return None
+    return path
+
+
+def new_job(source: str, quality: str, subdir: str = "") -> dict[str, Any]:
     job = {
         "id": uuid.uuid4().hex[:12],
         "source": source,
         "quality": quality,
+        "subdir": subdir,
         "status": "queued",
         "stage": "等待中",
         "author": "",
@@ -314,6 +339,38 @@ def new_job(source: str, quality: str) -> dict[str, Any]:
         job_order.insert(0, job["id"])
     emit_job(job)
     return job
+
+
+def retry_failed_jobs(job_ids: Optional[list[str]] = None) -> list[dict[str, Any]]:
+    with lock:
+        candidates = []
+        if job_ids:
+            wanted = {str(item) for item in job_ids if item}
+            for job_id in job_order:
+                job = jobs.get(job_id)
+                if job and job_id in wanted and job.get("status") == "error":
+                    candidates.append(dict(job))
+        else:
+            for job_id in job_order:
+                job = jobs.get(job_id)
+                if job and job.get("status") == "error":
+                    candidates.append(dict(job))
+    created: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for job in candidates:
+        source = (job.get("source") or "").strip()
+        if not source:
+            continue
+        quality = (job.get("quality") or settings.get("quality") or "best").strip()
+        if quality in {"HLS", "video"} or quality.endswith("p"):
+            quality = settings.get("quality") or "best"
+        subdir = (job.get("subdir") or "").strip()
+        key = (source, subdir)
+        if key in seen:
+            continue
+        seen.add(key)
+        created.append(new_job(source, quality, subdir=subdir))
+    return created
 
 
 def update_job(job_id: str, **fields: Any) -> dict[str, Any]:
@@ -425,6 +482,7 @@ def finish_item(job_id: str, prepared: xdl.PreparedDownload, skipped: bool, fina
         prepared.duration = float(probed["duration"])
     thumb = ensure_thumb(prepared)
     meta = prepared.to_meta(size)
+    meta["filename"] = library_relpath(prepared.dest)
     meta["mtime"] = prepared.dest.stat().st_mtime if prepared.dest.exists() else time.time()
     meta["thumb"] = thumb
     upsert_library(meta)
@@ -432,7 +490,7 @@ def finish_item(job_id: str, prepared: xdl.PreparedDownload, skipped: bool, fina
         "author": prepared.author,
         "tweet_id": prepared.tweet_id,
         "text": prepared.text,
-        "filename": prepared.dest.name,
+        "filename": library_relpath(prepared.dest),
         "thumb": thumb,
         "duration": prepared.duration,
         "quality": meta["quality"],
@@ -454,6 +512,10 @@ def run_one(job: dict[str, Any]) -> None:
     source = job["source"]
     quality = job["quality"]
     folder = out_dir()
+    subdir = (job.get("subdir") or "").strip()
+    if subdir:
+        folder = folder / Path(subdir).name
+        folder.mkdir(parents=True, exist_ok=True)
     update_job(job_id, status="resolving", stage="解析中", percent=0)
     try:
         if source.startswith("http") and xdl.is_eve568_play_url(source):
@@ -598,9 +660,19 @@ def worker_loop() -> None:
 
 def enqueue(text: str, quality: str) -> list[dict[str, Any]]:
     items = xdl.extract_all_inputs(text)
-    if not items:
-        raise ValueError("没有识别到推文链接、ID、archives 或 eve568 播放页")
-    created = [new_job(item, quality) for item in items]
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        batch: list[tuple[str, str]] = [(item, "")]
+        if item.startswith("http") and xdl.is_eve568_search_url(item):
+            batch = xdl.expand_eve568_search_jobs(item)
+        for url, subdir in batch:
+            if url not in seen:
+                seen.add(url)
+                expanded.append((url, subdir))
+    if not expanded:
+        raise ValueError("没有识别到推文链接、ID、archives、eve568 链接或搜索关键词")
+    created = [new_job(url, quality, subdir=subdir) for url, subdir in expanded]
     return created
 
 
@@ -780,15 +852,16 @@ class Handler(BaseHTTPRequestHandler):
                 if folder:
                     reveal_in_finder(out_dir())
                 elif filename:
-                    reveal_in_finder(out_dir() / filename)
+                    target = media_path(filename) or (out_dir() / Path(filename).name)
+                    reveal_in_finder(target)
                 else:
                     reveal_in_finder(out_dir())
                 status, body, ctype = json_bytes({"ok": True})
                 return self._send(status, body, ctype)
             if path == "/api/delete":
-                filename = Path(data.get("filename") or "").name
-                target = out_dir() / filename
-                if filename and target.exists():
+                filename = (data.get("filename") or "").replace("\\", "/").lstrip("/")
+                target = media_path(filename)
+                if filename and target and target.exists():
                     target.unlink()
                 thumb = thumbs_dir() / f"{Path(filename).stem}.jpg"
                 if thumb.exists():
@@ -796,6 +869,13 @@ class Handler(BaseHTTPRequestHandler):
                 remove_library(filename)
                 publish({"type": "library"})
                 status, body, ctype = json_bytes({"ok": True})
+                return self._send(status, body, ctype)
+            if path == "/api/retry-failed":
+                ids = data.get("ids") if isinstance(data.get("ids"), list) else None
+                if data.get("id") and not ids:
+                    ids = [data.get("id")]
+                created = retry_failed_jobs(ids)
+                status, body, ctype = json_bytes({"ok": True, "jobs": created, "count": len(created)})
                 return self._send(status, body, ctype)
             if path == "/api/clear-done":
                 with lock:
@@ -870,9 +950,9 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, path.read_bytes(), "image/jpeg")
 
     def _send_video(self, name: str) -> None:
-        name = Path(unquote(name)).name
-        path = out_dir() / name
-        if not path.exists() or not path.is_file():
+        rel = unquote(name).replace("\\", "/").lstrip("/")
+        path = media_path(rel)
+        if not path or not path.exists() or not path.is_file():
             self._send(404, b"not found", "text/plain")
             return
         size = path.stat().st_size

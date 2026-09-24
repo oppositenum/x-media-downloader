@@ -31,7 +31,7 @@
             <textarea
               id="urls"
               rows="5"
-              placeholder="粘贴推文、archives，或 eve568 入口+播放链接。eve568 入口带 ?u=&n=&s= 会自动记住"
+              placeholder="粘贴推文、archives、eve568 链接，或直接贴名字（例如 三上悠亜）按全站搜索批量下"
             ></textarea>
             <div class="composer-row">
               <label class="field">
@@ -67,10 +67,13 @@
 
           <div class="section-head">
             <h2>任务</h2>
-            <button id="clearDone" class="text-btn" type="button">清除已完成</button>
+            <div class="section-actions">
+              <button id="retryFailed" class="text-btn" type="button">重试失败</button>
+              <button id="clearDone" class="text-btn" type="button">清除已完成</button>
+            </div>
           </div>
           <div id="jobs" class="jobs"></div>
-          <p id="jobsEmpty" class="empty">还没有任务。贴一条推文、archives 或 eve568 播放链接开始。</p>
+          <p id="jobsEmpty" class="empty">还没有任务。贴链接，或直接贴名字做 eve568 搜索。</p>
         </section>
 
         <section class="pane pane-right">

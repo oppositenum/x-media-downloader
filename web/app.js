@@ -86,6 +86,7 @@ function renderJobs() {
     const title = job.author ? `@${job.author}` : job.source;
     const sub = preview(job.text) || job.filename || job.source;
     const canCancel = ["queued", "resolving", "downloading"].includes(job.status);
+    const canRetry = job.status === "error";
     const canPlay = ["done", "skipped"].includes(job.status) && job.filename;
     el.innerHTML = `
       <div class="job-top">
@@ -100,6 +101,7 @@ function renderJobs() {
         <span>${jobFoot(job)}</span>
         <div class="job-actions">
           ${canPlay ? `<button class="ghost" data-play="${escapeAttr(job.filename)}">播放</button>` : ""}
+          ${canRetry ? `<button class="ghost" data-retry="${job.id}">重试</button>` : ""}
           ${canCancel ? `<button class="ghost" data-cancel="${job.id}">取消</button>` : ""}
         </div>
       </div>
@@ -183,7 +185,7 @@ function openPlayer(filename) {
   $("playerSub").textContent = [fmtDur(item.duration), item.quality, fmtBytes(item.size), preview(item.text)]
     .filter(Boolean)
     .join("  ·  ");
-  video.src = `/media/${encodeURIComponent(filename)}`;
+  video.src = `/media/${filename.split("/").map(encodeURIComponent).join("/")}`;
   player.hidden = false;
   player.classList.remove("hidden");
   video.play().catch(() => {});
@@ -220,8 +222,9 @@ function connectEvents() {
 $("download").addEventListener("click", async () => {
   const text = $("urls").value.trim();
   $("composerHint").textContent = "";
+  $("composerHint").classList.remove("ok");
   if (!text) {
-    $("composerHint").textContent = "先贴一条推文、archives 或 eve568 播放链接。";
+    $("composerHint").textContent = "先贴一条链接，或直接贴名字做 eve568 搜索。";
     return;
   }
   $("download").disabled = true;
@@ -295,6 +298,19 @@ $("proxyTest").addEventListener("click", async () => {
 });
 
 $("search").addEventListener("input", renderLibrary);
+$("retryFailed").addEventListener("click", async () => {
+  const hint = $("composerHint");
+  hint.textContent = "";
+  hint.classList.remove("ok");
+  try {
+    const data = await api("/api/retry-failed", {});
+    const n = data.count || (data.jobs || []).length;
+    hint.textContent = n ? `已重新入队 ${n} 条失败任务` : "没有失败任务";
+    if (n) hint.classList.add("ok");
+  } catch (err) {
+    hint.textContent = err.message;
+  }
+});
 $("clearDone").addEventListener("click", () => api("/api/clear-done").catch(() => {}));
 $("openDir").addEventListener("click", () => api("/api/open", { folder: true }).catch(() => {}));
 $("pickDir").addEventListener("click", async () => {
@@ -307,10 +323,13 @@ $("pickDir").addEventListener("click", async () => {
 });
 
 document.addEventListener("click", async (ev) => {
-  const t = ev.target.closest("[data-play],[data-cancel],[data-open],[data-del],[data-close]");
+  const t = ev.target.closest("[data-play],[data-cancel],[data-retry],[data-open],[data-del],[data-close]");
   if (!t) return;
   if (t.dataset.close) return closePlayer();
   if (t.dataset.play) return openPlayer(t.dataset.play);
+  if (t.dataset.retry) return api("/api/retry-failed", { id: t.dataset.retry }).catch((err) => {
+    $("composerHint").textContent = err.message;
+  });
   if (t.dataset.cancel) return api("/api/cancel", { id: t.dataset.cancel }).catch(() => {});
   if (t.dataset.open) return api("/api/open", { filename: t.dataset.open }).catch(() => {});
   if (t.dataset.del) {

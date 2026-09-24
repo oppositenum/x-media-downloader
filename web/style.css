@@ -269,6 +269,16 @@ button {
   font-size: 12px;
 }
 
+.hint.ok {
+  color: var(--ok);
+}
+
+.section-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .section-head {
   display: flex;
   align-items: center;

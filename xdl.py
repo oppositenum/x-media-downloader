@@ -67,11 +67,25 @@ EVE568_PLAY_RE = re.compile(
     r"([a-fA-F0-9]{24})(?:\?[^\s\"'<>]*)?",
     re.I,
 )
+EVE568_SEARCH_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?([a-zA-Z0-9.-]+)/v/"
+    r"(?:(adult-long-video|adult-short-video|movie|tv)/)?search(?:/[^\s\"'<>]*)?"
+    r"(\?[^\s\"'<>]*)?",
+    re.I,
+)
 EVE568_PORTAL_RE = re.compile(
     r"(?:https?://)?(?:www\.)?([a-zA-Z0-9.-]+)/v(?:/|\?(?:[^\s\"'<>]*))?",
     re.I,
 )
 EVE568_HOST_RE = re.compile(r"(?:^|\.)eve568\.com$", re.I)
+EVE568_CATEGORY_IDS = {
+    "adult-long-video": "5b73eb8886d00574944a9dc1",
+    "adult-short-video": "5b73eb8886d00574944a9dc2",
+    "movie": "5b73eb8886d00574944a9dc3",
+    "tv": "5b73eb8886d00574944a9dc4",
+}
+EVE568_CATEGORY_KINDS = {value: key for key, value in EVE568_CATEGORY_IDS.items()}
+EVE568_SEARCH_PAGE_SIZE = 30
 DIM_RE = re.compile(r"/(\d+)x(\d+)/")
 HLS_WORKERS = 4
 HLS_SEGMENT_RETRIES = 6
@@ -421,6 +435,44 @@ def is_eve568_play_url(value: str) -> bool:
     return bool(EVE568_PLAY_RE.search(value or ""))
 
 
+def normalize_eve568_search_url(raw: str) -> str:
+    m = EVE568_SEARCH_RE.search(raw or "")
+    if not m:
+        return (raw or "").strip()
+    host, kind, query = m.group(1), m.group(2), m.group(3) or ""
+    scheme = "http"
+    if (raw or "").lower().startswith("https://"):
+        scheme = "https"
+    if kind:
+        return f"{scheme}://{host}/v/{kind}/search{query}"
+    return f"{scheme}://{host}/v/search{query}"
+
+
+def is_eve568_search_url(value: str) -> bool:
+    return bool(EVE568_SEARCH_RE.search(value or "")) and not is_eve568_play_url(value or "")
+
+
+def is_eve568_global_search_url(value: str) -> bool:
+    m = EVE568_SEARCH_RE.search(value or "")
+    return bool(m and not m.group(2)) and not is_eve568_play_url(value or "")
+
+
+def eve568_search_folder_name(page_url: str) -> str:
+    parsed = urllib.parse.urlparse(page_url if "://" in (page_url or "") else "http://" + (page_url or ""))
+    query = urllib.parse.parse_qs(parsed.query)
+    for key in ("keyword", "actorName", "manufacturer"):
+        values = query.get(key) or []
+        if values and values[0].strip():
+            return safe_filename(values[0].strip())
+    return ""
+
+
+def eve568_keyword_search_url(keyword: str) -> str:
+    keyword = (keyword or "").strip()
+    origin = eve568_origin() or "http://pk.eve568.com"
+    return f"{origin.rstrip('/')}/v/search?keyword={urllib.parse.quote(keyword)}"
+
+
 def eve568_query_creds(url: str) -> dict[str, str]:
     parsed = urllib.parse.urlparse(url if "://" in (url or "") else "https://" + (url or ""))
     query = urllib.parse.parse_qs(parsed.query)
@@ -459,15 +511,34 @@ def extract_all_inputs(text: str) -> list[str]:
 
     for m in EVE568_PLAY_RE.finditer(text or ""):
         add(normalize_eve568_play_url(m.group(0)))
+    for m in EVE568_SEARCH_RE.finditer(text or ""):
+        add(normalize_eve568_search_url(m.group(0)))
     for m in ARCHIVES_URL_RE.finditer(text or ""):
         add(normalize_archives_url(m.group(1), m.group(2)))
     for m in TWEET_URL_RE.finditer(text or ""):
         add(m.group(1))
     for m in VIDEO_CDN_RE.finditer(text or ""):
         add(m.group(0).rstrip(".,);]"))
-    if not items:
-        for m in STATUS_ID_RE.finditer(text or ""):
-            add(m.group(1))
+    leftover: list[str] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or re.search(r"https?://", line, re.I):
+            continue
+        leftover.append(line)
+    if leftover:
+        for line in leftover:
+            if STATUS_ID_RE.fullmatch(line):
+                if not items:
+                    add(line)
+                continue
+            add(eve568_keyword_search_url(line))
+    elif not items:
+        blob = (text or "").strip()
+        if blob and not re.search(r"https?://", blob, re.I) and not STATUS_ID_RE.fullmatch(blob):
+            add(eve568_keyword_search_url(blob))
+        elif not items:
+            for m in STATUS_ID_RE.finditer(text or ""):
+                add(m.group(1))
     return items
 
 
@@ -2005,6 +2076,82 @@ def join_eve568_media(cdn_url: str, path: str) -> str:
     return base + "/" + path.lstrip("/")
 
 
+def fetch_eve568_search_page(origin: str, kinds: list[str], queries: dict, page: int) -> dict:
+    categories = []
+    for kind in kinds:
+        category = EVE568_CATEGORY_IDS.get(kind or "")
+        if category and category not in categories:
+            categories.append(category)
+    if not categories:
+        raise RuntimeError(f"不支持的 eve568 分类: {kinds}")
+    token = eve568_token(origin)
+    pairs = [("categoryId", item) for item in categories]
+    pairs.append(("limit", str(EVE568_SEARCH_PAGE_SIZE)))
+    pairs.append(("page", str(page)))
+    for key in ("keyword", "actorName", "manufacturer"):
+        value = (queries.get(key) or "").strip()
+        if value:
+            pairs.append((key, value))
+    url = eve568_api(origin, "videos") + "?" + urllib.parse.urlencode(pairs)
+    headers = {
+        "Origin": origin,
+        "Referer": origin + "/",
+        "Authorization": f"Bearer {token}",
+    }
+    try:
+        data = http_request_json(url, headers=headers)
+    except Exception as err:
+        if not _eve568_auth_failed(err):
+            raise
+        token = eve568_token(origin, force=True, refresh_portal=True)
+        headers["Authorization"] = f"Bearer {token}"
+        data = http_request_json(url, headers=headers)
+    if not isinstance(data, dict):
+        raise RuntimeError("eve568 搜索结果格式异常")
+    return data
+
+
+def expand_eve568_search_url(page_url: str) -> list[str]:
+    m = EVE568_SEARCH_RE.search(page_url)
+    if not m:
+        raise RuntimeError("无法识别 eve568 搜索链接")
+    host, kind = m.group(1), m.group(2)
+    kinds = [kind] if kind else ["adult-long-video", "adult-short-video"]
+    origin = eve568_origin(page_url)
+    parsed = urllib.parse.urlparse(page_url if "://" in page_url else "http://" + page_url)
+    query = {k: (v[0] if v else "") for k, v in urllib.parse.parse_qs(parsed.query).items()}
+    if not any(query.get(k) for k in ("keyword", "actorName", "manufacturer")):
+        raise RuntimeError("搜索链接缺少 keyword / actorName / manufacturer")
+    first = fetch_eve568_search_page(origin, kinds, query, 1)
+    items = first.get("data") if isinstance(first.get("data"), list) else []
+    num_pages = int(first.get("numOfPages") or 1)
+    for page in range(2, max(num_pages, 1) + 1):
+        more = fetch_eve568_search_page(origin, kinds, query, page)
+        extra = more.get("data") if isinstance(more.get("data"), list) else []
+        items.extend(extra)
+    urls: list[str] = []
+    seen: set[str] = set()
+    scheme = parsed.scheme or "http"
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        video_id = str(item.get("id") or "")
+        if not video_id or video_id in seen:
+            continue
+        seen.add(video_id)
+        item_kind = EVE568_CATEGORY_KINDS.get(str(item.get("categoryId") or ""), kind or "adult-long-video")
+        urls.append(f"{scheme}://{host}/v/{item_kind}/play/{video_id}")
+    if not urls:
+        raise RuntimeError("搜索结果是空的")
+    return urls
+
+
+def expand_eve568_search_jobs(page_url: str) -> list[tuple[str, str]]:
+    urls = expand_eve568_search_url(page_url)
+    folder = eve568_search_folder_name(page_url) if is_eve568_global_search_url(page_url) else ""
+    return [(url, folder) for url in urls]
+
+
 def refresh_eve568_media_url(page_url: str) -> str:
     m = EVE568_PLAY_RE.search(page_url)
     if not m:
@@ -2296,6 +2443,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     errors = 0
     for item in items:
         try:
+            if item.startswith("http") and is_eve568_search_url(item):
+                for play_url, subdir in expand_eve568_search_jobs(item):
+                    dest_dir = out_dir / subdir if subdir else out_dir
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    errors += process_eve568(
+                        play_url,
+                        out_dir=dest_dir,
+                        info_only=args.info,
+                        skip_existing=not args.no_skip,
+                    )
+                continue
             if item.startswith("http") and is_eve568_play_url(item):
                 errors += process_eve568(
                     item,
