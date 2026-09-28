@@ -72,6 +72,14 @@
               <button id="clearDone" class="text-btn" type="button">清除已完成</button>
             </div>
           </div>
+          <div id="jobSummary" class="job-summary" hidden>
+            <span data-k="total">共 0</span>
+            <span data-k="done" class="ok">已完成 0</span>
+            <span data-k="running">进行中 0</span>
+            <span data-k="error" class="bad">失败 0</span>
+            <span data-k="cancelled">已取消 0</span>
+            <span class="job-summary-bar"><i id="jobSummaryBar"></i></span>
+          </div>
           <div id="jobs" class="jobs"></div>
           <p id="jobsEmpty" class="empty">还没有任务。贴链接，或直接贴名字做 eve568 搜索。</p>
         </section>

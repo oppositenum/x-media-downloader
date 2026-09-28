@@ -75,7 +75,42 @@ function render() {
   renderLibrary();
 }
 
+function jobCounts() {
+  const counts = { total: 0, done: 0, skipped: 0, running: 0, error: 0, cancelled: 0 };
+  for (const job of state.jobs) {
+    counts.total += 1;
+    const status = job.status || "";
+    if (status === "done" || status === "skipped") counts.done += 1;
+    else if (status === "error") counts.error += 1;
+    else if (status === "cancelled") counts.cancelled += 1;
+    else counts.running += 1;
+    if (status === "skipped") counts.skipped += 1;
+  }
+  return counts;
+}
+
+function renderJobSummary() {
+  const box = $("jobSummary");
+  const bar = $("jobSummaryBar");
+  if (!box) return;
+  const c = jobCounts();
+  box.hidden = c.total === 0;
+  const doneLabel = c.skipped ? `已完成 ${c.done}（跳过 ${c.skipped}）` : `已完成 ${c.done}`;
+  const set = (key, text) => {
+    const el = box.querySelector(`[data-k="${key}"]`);
+    if (el) el.textContent = text;
+  };
+  set("total", `共 ${c.total}`);
+  set("done", doneLabel);
+  set("running", `进行中 ${c.running}`);
+  set("error", `失败 ${c.error}`);
+  set("cancelled", `已取消 ${c.cancelled}`);
+  const finished = c.done + c.error + c.cancelled;
+  if (bar) bar.style.width = `${c.total ? Math.round((finished * 100) / c.total) : 0}%`;
+}
+
 function renderJobs() {
+  renderJobSummary();
   const box = $("jobs");
   const empty = $("jobsEmpty");
   box.innerHTML = "";
