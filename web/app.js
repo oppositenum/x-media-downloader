@@ -237,6 +237,13 @@ function closePlayer() {
   state.playing = null;
 }
 
+function seekVideo(direction) {
+  const video = $("video");
+  if ($("player").hidden || !Number.isFinite(video.duration)) return;
+  const seconds = Number($("seekSeconds").value);
+  video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + direction * seconds));
+}
+
 function connectEvents() {
   const es = new EventSource("/api/events");
   es.onmessage = (ev) => {
@@ -375,6 +382,13 @@ document.addEventListener("click", async (ev) => {
 });
 
 $("playerClose").addEventListener("click", closePlayer);
+$("seekBack").addEventListener("click", () => seekVideo(-1));
+$("seekForward").addEventListener("click", () => seekVideo(1));
+const savedSeekSeconds = localStorage.getItem("xdl-seek-seconds");
+if (["5", "10", "15", "30"].includes(savedSeekSeconds)) $("seekSeconds").value = savedSeekSeconds;
+$("seekSeconds").addEventListener("change", (ev) => {
+  localStorage.setItem("xdl-seek-seconds", ev.target.value);
+});
 $("playerReveal").addEventListener("click", () => {
   if (state.playing && state.playing.filename) {
     api("/api/open", { filename: state.playing.filename }).catch(() => {});
@@ -383,6 +397,11 @@ $("playerReveal").addEventListener("click", () => {
 
 document.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape") closePlayer();
+  if ($("player").hidden || ev.altKey || ev.ctrlKey || ev.metaKey || ev.target === $("seekSeconds")) return;
+  if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") {
+    ev.preventDefault();
+    seekVideo(ev.key === "ArrowLeft" ? -1 : 1);
+  }
 });
 
 api("/api/state").then(applyState).catch((err) => {
